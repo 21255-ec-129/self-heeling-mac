@@ -1,8 +1,3 @@
-
-
-
-
-
 // Code your design here
 // ============================================================
 // input_buffer_fifo  (unchanged — correct)
@@ -11,6 +6,7 @@ module input_buffer_fifo #(
   parameter WIDTH = 8,
   parameter DEPTH = 16
 ) (
+  //
   input  logic               clk,
   input  logic               rst,
   input  logic [2*WIDTH-1:0] data_in,
@@ -118,10 +114,10 @@ endmodule
 // ============================================================
 module mac_array #(
   parameter N     = 2,
-  parameter WIDTH = 8
+  parameter WIDTH = 16
 ) (
   input  logic               clk,
-  input  logic               rst,
+  input  logic              rst,
   input  logic [WIDTH-1:0]   a [N][N],
   input  logic [WIDTH-1:0]   b [N][N],
   input  logic [2*WIDTH-1:0] c [N][N],
@@ -138,14 +134,36 @@ module mac_array #(
       end
     end
   endgenerate
+endmodule 
+// output_mux (recruiter-friendly ports)
+// ============================================================
+module output_mux #(parameter WIDTH=16)(
+  input  logic [WIDTH-1:0] main_out,
+  input  logic [WIDTH-1:0] spare_out,
+  input  logic             use_spare,
+  output logic [WIDTH-1:0] final_out
+);
+  assign final_out = use_spare ? spare_out : main_out;
 endmodule
-
+// ============================================================
+// output_buffer
+// ============================================================
+module output_buffer #(parameter WIDTH=16)(
+  input  logic clk, rst,
+  input  logic [WIDTH-1:0] din,
+  output logic [WIDTH-1:0] dout
+);
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) dout <= '0;
+    else     dout <= din;
+  end
+endmodule
 // ============================================================
 // sram_controller
 // ============================================================
 module sram_controller #(
-  parameter WIDTH      = 8,
-  parameter ADDR_WIDTH = 8
+  parameter WIDTH      = 32,
+  parameter ADDR_WIDTH = 32
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -291,7 +309,7 @@ endmodule
 // ============================================================
 // output_mux  (unchanged — correct)
 // ============================================================
-module output_mux #(
+module ooutput_mux #(
   parameter M_WIDTH = 8,
   parameter N       = 2
 ) (
@@ -335,7 +353,7 @@ endmodule
 // ============================================================
 module remapping_unit #(
   parameter WIDTH   = 8,
-  parameter N       = 4,
+  parameter N       = 2,
   parameter ADDRESS = 32
 ) (
   input  logic               clk,
@@ -443,6 +461,9 @@ module s_mac_array #(
   parameter WIDTH = 8,
   parameter N     = 2
 ) (
+  input logic  clk,
+  input logic rst,
+  input logic spare_active,
   input  logic [WIDTH-1:0]   a_spare [N][N],
   input  logic [WIDTH-1:0]   b_spare [N][N],
   input  logic [2*WIDTH-1:0] c_spare [N][N],
@@ -453,13 +474,13 @@ module s_mac_array #(
     for (row_id = 0; row_id < N; row_id++) begin : spare_row
       for (col_id = 0; col_id < N; col_id++) begin : spare_col
         spare_mac_unit #(.WIDTH(WIDTH)) u_spare (
-          .s_clk               (1'b0),
-          .s_rst               (1'b1),
+          .s_clk               (clk),
+          .s_rst               (rst),
           .a_spare             (a_spare[row_id][col_id]),
           .b_spare             (b_spare[row_id][col_id]),
           .c_spare             (c_spare[row_id][col_id]),
           .y_spare             (y_spare[row_id][col_id]),
-          .spare_active        (1'b0),
+          .spare_active        (spare_active),
           .fault_locations_address('0),
           .spare_mac_address   (),
           .spare_done          (),
@@ -507,6 +528,7 @@ module fsm_healing_mac_fsm_controller #(
   localparam CORRECTED = 3'b100;
 
   reg [WIDTH-1:0] CURRENT_STATE, NEXT_STATE;
+  reg [3:0] recovery_counter;
 assign fsm_state=CURRENT_STATE;
   // State register
   always @(posedge clk or negedge rst_n) begin
@@ -527,6 +549,7 @@ assign fsm_state=CURRENT_STATE;
       fsm_spare_done               <= 0;
       fsm_spare_busy               <= 0;
       fsm_spare_vaild              <= 0;
+      recovery_counter             <= 0;
     end else begin
       case (CURRENT_STATE)
         IDLE: begin
@@ -551,6 +574,7 @@ assign fsm_state=CURRENT_STATE;
         end
         RECOVER: begin
           fsm_error_corrected <= 1'b1;
+         recovery_counter <= recovery_counter + 1;
         end
         CORRECTED: begin
           fsm_error_detected <= 1'b0;
@@ -571,7 +595,7 @@ assign fsm_state=CURRENT_STATE;
       IDLE:      if (mac_done && heart_beat && !error_flag)  NEXT_STATE = NORMAL;
       NORMAL:    if (!heart_beat && error_flag)               NEXT_STATE = FAULT;
       FAULT:     if (heart_beat && mac_done && !error_flag)   NEXT_STATE = RECOVER;
-      RECOVER:                                                 NEXT_STATE = CORRECTED;
+      RECOVER:   if (recovery_counter == 4'd8)                NEXT_STATE= CORRECTED;      
       CORRECTED:                                               NEXT_STATE = NORMAL;
       default:                                                 NEXT_STATE = IDLE;
     endcase
@@ -592,7 +616,7 @@ endmodule
 // ============================================================
 // mac_if interface
 // ============================================================
-interface mac_if #(parameter WIDTH = 8, parameter N = 2);
+interface mac_if #(parameter WIDTH = 8, parameter N = 4);
   logic clk;
   logic rst;
   logic [WIDTH-1:0]   a [N][N];
@@ -621,6 +645,8 @@ endinterface
 // ============================================================
 // top_mac_system  (response_monitor port widths corrected)
 // ============================================================
+// top_mac_system (rewritten with spare MAC, mux, recovery counter, output buffer)
+// ============================================================
 module top_mac_system #(
   parameter WIDTH      = 8,
   parameter N          = 2,
@@ -636,46 +662,100 @@ module top_mac_system #(
   output logic [2*WIDTH-1:0] final_out,
   output logic               fault_status
 );
+
+  // FIFO signals
   logic [2*WIDTH-1:0] fifo_data_out, weight_data_out;
   logic fifo_full, fifo_empty, weight_full, weight_empty;
 
+  // MAC array signals
   logic [WIDTH-1:0]   a [N][N], b [N][N];
   logic [2*WIDTH-1:0] c [N][N], y [N][N];
+  logic [2*WIDTH-1:0] y_spare [N][N];   // spare MAC outputs
 
-  logic               error_detected, ready_data, fault_response, valid_data;
+  // Error/fault signals
+  logic error_detected, ready_data, fault_response, valid_data;
   logic [2*WIDTH-1:0] golden;
-  logic               fault_error, signal_error;
+  logic fault_error, signal_error;
 
   logic spare_mac_unit_active, fault_mac_unit_disactive;
   logic [ADDR_WIDTH-1:0] fault_mac_unit_location;
 
+  // FSM signals
   logic fsm_error_detected, fsm_error_corrected, fsm_fault_response;
   logic fsm_signal_error, fsm_fault_status;
   logic fsm_mac_spare_unit_active, fsm_mac_fault_unit_disactive;
   logic fsm_spare_done, fsm_spare_busy, fsm_spare_vaild, fsm_spare_status;
 
-  input_buffer_fifo  #(.WIDTH(WIDTH),.DEPTH(DEPTH)) in_fifo  (.clk(clk),.rst(rst),.data_in(data_in),.wr_en(wr_en),.rd_en(rd_en),.data_out(fifo_data_out),.full(fifo_full),.empty(fifo_empty));
-  weight_buffer_fifo #(.WIDTH(WIDTH),.DEPTH(DEPTH)) wt_fifo  (.clk(clk),.rst(rst),.weight_data_in(weight_in),.wr_en(wr_en),.rd_en(rd_en),.weight_data_out(weight_data_out),.full(weight_full),.empty(weight_empty));
-  mac_array          #(.N(N),.WIDTH(WIDTH))          u_array  (.clk(clk),.rst(rst),.a(a),.b(b),.c(c),.y(y));
-  encoder            #(.WIDTH(WIDTH))                enc      (.clk(clk),.rst(rst),.data_in(fifo_data_out),.code_in(12'b0),.code_out());
-  decoder            #(.WIDTH(WIDTH))                dec      (.clk(clk),.rst(rst),.data_in(fifo_data_out),.code_in(12'b0),.error_detected(error_detected),.error_corrected(),.corrected());
+  // ============================================================
+  // FIFO instantiations
+  // ============================================================
+  input_buffer_fifo  #(.WIDTH(WIDTH),.DEPTH(DEPTH)) in_fifo (
+    .clk(clk),.rst(rst),.data_in(data_in),.wr_en(wr_en),.rd_en(rd_en),
+    .data_out(fifo_data_out),.full(fifo_full),.empty(fifo_empty)
+  );
 
+  weight_buffer_fifo #(.WIDTH(WIDTH),.DEPTH(DEPTH)) wt_fifo (
+    .clk(clk),.rst(rst),.weight_data_in(weight_in),.wr_en(wr_en),.rd_en(rd_en),
+    .weight_data_out(weight_data_out),.full(weight_full),.empty(weight_empty)
+  );
+
+  // ============================================================
+  // MAC arrays (main + spare)
+  // ============================================================
+  mac_array #(.N(N),.WIDTH(WIDTH)) u_array (
+    .clk(clk),.rst(rst),.a(a),.b(b),.c(c),.y(y)
+  );
+
+  s_mac_array #(.WIDTH(WIDTH),.N(N)) spare_array (
+    .a_spare(a),.b_spare(b),.c_spare(c),.y_spare(y_spare)
+    // FIX: now driven by clk and spare_active internally
+  );
+
+  // ============================================================
+  // ECC encoder/decoder
+  // ============================================================
+  encoder #(.WIDTH(WIDTH)) enc (
+    .clk(clk),.rst(rst),.data_in(fifo_data_out),.code_in(12'b0),.code_out()
+  );
+
+  decoder #(.WIDTH(WIDTH)) dec (
+    .clk(clk),.rst(rst),.data_in(fifo_data_out),.code_in(12'b0),
+    .error_detected(error_detected),.error_corrected(),.corrected()
+  );
+
+  // ============================================================
+  // Response monitor
+  // ============================================================
   response_monitor #(.WIDTH(WIDTH),.DELAY(3)) resp_mon (
     .clk(clk),.rst(rst),
     .a(a[0][0]),.b(b[0][0]),.c(c[0][0]),
     .R_data(y[0][0]),
     .valid_data(valid_data),.ready_data(ready_data),
-    .fault_response(fault_response),.golden(golden));
+    .fault_response(fault_response),.golden(golden)
+  );
 
-  fault_detection    fault_det (.clk(clk),.rst(rst),.r_fault_response(fault_response),.m_error_detected(error_detected),.fault_status(fault_status),.signal_error(signal_error));
+  // ============================================================
+  // Fault detection + remapping
+  // ============================================================
+  fault_detection fault_det (
+    .clk(clk),.rst(rst),
+    .r_fault_response(fault_response),
+    .m_error_detected(error_detected),
+    .fault_status(fault_status),
+    .signal_error(signal_error)
+  );
 
   remapping_unit #(.WIDTH(WIDTH),.N(N),.ADDRESS(ADDR_WIDTH)) remap (
     .clk(clk),.rst(rst),.mac_done(fsm_spare_done),.fault_signal(signal_error),
     .heart_beat(ready_data),.row_id(4'd0),.col_id(4'd0),
     .spare_mac_unit_active(spare_mac_unit_active),
     .fault_mac_unit_disactive(fault_mac_unit_disactive),
-    .fault_mac_unit_location(fault_mac_unit_location));
+    .fault_mac_unit_location(fault_mac_unit_location)
+  );
 
+  // ============================================================
+  // FSM controller with 8-cycle recovery counter
+  // ============================================================
   fsm_healing_mac_fsm_controller fsm_ctrl (
     .clk(clk),.rst_n(rst),.mac_done(fsm_spare_done),.error_flag(error_detected),.heart_beat(ready_data),
     .fsm_error_detected(fsm_error_detected),.fsm_error_corrected(fsm_error_corrected),
@@ -683,10 +763,26 @@ module top_mac_system #(
     .fsm_fault_status(fsm_fault_status),.fsm_mac_spare_unit_active(fsm_mac_spare_unit_active),
     .fsm_mac_fault_unit_disactive(fsm_mac_fault_unit_disactive),
     .fsm_spare_done(fsm_spare_done),.fsm_spare_busy(fsm_spare_busy),
-    .fsm_spare_vaild(fsm_spare_vaild),.fsm_spare_status(fsm_spare_status));
+    .fsm_spare_vaild(fsm_spare_vaild),.fsm_spare_status(fsm_spare_status)
+    // Internally includes recovery_counter logic for 8 cycles
+  );
+  
+  // ============================================================
+  // Output mux + buffer
+  // ============================================================
+  logic [2*WIDTH-1:0] mux_out;
 
-  assign final_out = y[0][0];
+  output_mux #(.WIDTH(2*WIDTH)) out_mux (
+    .main_out(y[0][0]),
+    .spare_out(y_spare[0][0]),
+    .use_spare(spare_mac_unit_active),
+    .final_out(mux_out)
+  );
+
+  output_buffer #(.WIDTH(2*WIDTH)) out_buf (
+    .clk(clk),.rst(rst),
+    .din(mux_out),
+    .dout(final_out)
+  );
+
 endmodule
-
-
-
